@@ -123,9 +123,9 @@ pub enum FindKeyError {
     Other(Error),
 }
 
-impl From<crate::error::Error> for FindKeyError {
-    fn from(err: crate::error::Error) -> Self {
-        FindKeyError::Other(err)
+impl<T: Into<Error>> From<T> for FindKeyError {
+    fn from(err: T) -> Self {
+        FindKeyError::Other(err.into())
     }
 }
 
