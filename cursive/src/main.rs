@@ -1325,8 +1325,7 @@ fn get_translation_catalog() -> gettext::Catalog {
 
     for preferred in locale.tags_for("messages") {
         for loc in &translation_locations {
-            let langid_res: std::result::Result<LanguageIdentifier, _> =
-                format!("{preferred}").parse();
+            let langid_res: Result<LanguageIdentifier, _> = format!("{preferred}").parse();
 
             if let Ok(langid) = langid_res {
                 let file = std::fs::File::open(format!("{}/{}.mo", loc, langid.language));
@@ -1340,7 +1339,7 @@ fn get_translation_catalog() -> gettext::Catalog {
     }
 
     for preferred in locale.tags_for("messages") {
-        let langid_res: std::result::Result<LanguageIdentifier, _> = format!("{preferred}").parse();
+        let langid_res: Result<LanguageIdentifier, _> = format!("{preferred}").parse();
 
         if let Ok(langid) = langid_res {
             let file = std::fs::File::open(format!(

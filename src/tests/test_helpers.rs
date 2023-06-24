@@ -209,7 +209,7 @@ impl Crypto for MockCrypto {
         _: &[u8],
         _: &[u8],
         _: &[[u8; 20]],
-    ) -> std::result::Result<SignatureStatus, VerificationError> {
+    ) -> Result<SignatureStatus, VerificationError> {
         self.verify_called.replace(true);
         Err(VerificationError::SignatureFromWrongRecipient)
     }
@@ -328,11 +328,11 @@ struct KeyLister {
 }
 
 impl VerificationHelper for &mut KeyLister {
-    fn get_certs(&mut self, _: &[KeyHandle]) -> std::result::Result<Vec<Cert>, anyhow::Error> {
+    fn get_certs(&mut self, _: &[KeyHandle]) -> Result<Vec<Cert>, anyhow::Error> {
         Ok(vec![])
     }
 
-    fn check(&mut self, _structure: MessageStructure) -> std::result::Result<(), anyhow::Error> {
+    fn check(&mut self, _structure: MessageStructure) -> Result<(), anyhow::Error> {
         Ok(())
     }
 }
@@ -344,7 +344,7 @@ impl DecryptionHelper for &mut KeyLister {
         _: &[sequoia_openpgp::packet::SKESK],
         _: Option<sequoia_openpgp::types::SymmetricAlgorithm>,
         _: D,
-    ) -> std::result::Result<Option<sequoia_openpgp::Fingerprint>, anyhow::Error>
+    ) -> Result<Option<sequoia_openpgp::Fingerprint>, anyhow::Error>
     where
         D: FnMut(
             sequoia_openpgp::types::SymmetricAlgorithm,

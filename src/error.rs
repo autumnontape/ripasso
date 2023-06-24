@@ -214,7 +214,7 @@ impl std::fmt::Display for Error {
 }
 
 /// Convenience type for Results
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub fn to_result<T: chrono::TimeZone>(
     res: chrono::LocalResult<chrono::DateTime<T>>,

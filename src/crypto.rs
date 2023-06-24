@@ -59,7 +59,7 @@ impl std::convert::TryFrom<&str> for CryptoImpl {
 }
 
 impl Display for CryptoImpl {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
             Self::GpgMe => write!(f, "gpg"),
             Self::Sequoia => write!(f, "sequoia"),
@@ -202,7 +202,7 @@ pub trait Crypto {
         data: &[u8],
         sig: &[u8],
         valid_signing_keys: &[[u8; 20]],
-    ) -> std::result::Result<SignatureStatus, VerificationError>;
+    ) -> Result<SignatureStatus, VerificationError>;
 
     /// Returns true if a recipient is in the users keyring.
     fn is_key_in_keyring(&self, recipient: &Recipient) -> Result<bool>;
@@ -234,7 +234,7 @@ pub trait Crypto {
     fn own_fingerprint(&self) -> Option<[u8; 20]>;
 
     /// TODO
-    fn find_key(&self, password: Option<String>) -> std::result::Result<(), FindKeyError>;
+    fn find_key(&self, password: Option<String>) -> Result<(), FindKeyError>;
 }
 
 /// Used when the user configures gpgme to be used as a pgp backend.
@@ -322,7 +322,7 @@ impl Crypto for GpgMe {
         data: &[u8],
         sig: &[u8],
         valid_signing_keys: &[[u8; 20]],
-    ) -> std::result::Result<SignatureStatus, VerificationError> {
+    ) -> Result<SignatureStatus, VerificationError> {
         let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)
             .map_err(|e| VerificationError::InfrastructureError(format!("{e:?}")))?;
 
@@ -435,7 +435,7 @@ impl Crypto for GpgMe {
         None
     }
 
-    fn find_key(&self, _password: Option<String>) -> std::result::Result<(), FindKeyError> {
+    fn find_key(&self, _password: Option<String>) -> Result<(), FindKeyError> {
         Ok(())
     }
 }
@@ -500,7 +500,7 @@ impl<'a> VerificationHelper for Helper<'a> {
 
         for layer in structure {
             if let MessageLayer::SignatureGroup { results } = layer {
-                if results.iter().any(std::result::Result::is_ok) {
+                if results.iter().any(Result::is_ok) {
                     return Ok(());
                 }
             }
@@ -913,7 +913,7 @@ impl Crypto for Sequoia {
         data: &[u8],
         sig: &[u8],
         valid_signing_keys: &[[u8; 20]],
-    ) -> std::result::Result<SignatureStatus, VerificationError> {
+    ) -> Result<SignatureStatus, VerificationError> {
         let p = sequoia_openpgp::policy::StandardPolicy::new();
 
         let recipients: Vec<Recipient> = if valid_signing_keys.is_empty() {
@@ -1014,7 +1014,7 @@ impl Crypto for Sequoia {
         Some(self.user_key_id)
     }
 
-    fn find_key(&self, password: Option<String>) -> std::result::Result<(), FindKeyError> {
+    fn find_key(&self, password: Option<String>) -> Result<(), FindKeyError> {
         // move the password into a `Password` as soon as possible
         let password = password.map(sequoia_openpgp::crypto::Password::from);
         // save whether a password was given so we can drop `password` as soon as possible

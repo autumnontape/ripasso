@@ -243,7 +243,7 @@ fn cred(
     _url: &str,
     username: Option<&str>,
     allowed: git2::CredentialType,
-) -> std::result::Result<git2::Cred, git2::Error> {
+) -> Result<git2::Cred, git2::Error> {
     let sys_username = whoami::username();
     let user: &str = username.map_or(&sys_username, |name| name);
 
@@ -484,7 +484,7 @@ pub fn certificate_check(
     cert: &Cert<'_>,
     host: &str,
     home: &Option<PathBuf>,
-) -> std::result::Result<CertificateCheckStatus, git2::Error> {
+) -> Result<CertificateCheckStatus, git2::Error> {
     let port: Option<u16> = Some(22);
     let Some(host_key) = cert.as_hostkey() else {
         // Return passthrough for TLS X509 certificates to use whatever validation
@@ -691,7 +691,7 @@ fn check_ssh_known_hosts(
     cert_host_key: &git2::cert::CertHostkey<'_>,
     host: &str,
     home: &Option<PathBuf>,
-) -> std::result::Result<(), KnownHostError> {
+) -> Result<(), KnownHostError> {
     let Some(remote_host_key) = cert_host_key.hostkey() else {
         return Err(anyhow::format_err!("remote host key is not available").into());
     };
@@ -811,7 +811,7 @@ fn user_known_host_location(home: &Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// Loads an OpenSSH known_hosts file.
-fn load_hostfile(path: &Path) -> std::result::Result<Vec<KnownHost>, anyhow::Error> {
+fn load_hostfile(path: &Path) -> Result<Vec<KnownHost>, anyhow::Error> {
     let contents = String::from_utf8(std::fs::read(path)?)?;
     let entries = contents
         .lines()
