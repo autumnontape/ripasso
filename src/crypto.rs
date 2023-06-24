@@ -123,6 +123,17 @@ pub enum FindKeyError {
     Other(Error),
 }
 
+impl FindKeyError {
+    pub fn unwrap_other(self) -> Error {
+        match self {
+            FindKeyError::WrongPassword => {
+                panic!("tried to unwrap_other when the error was WrongPassword")
+            }
+            FindKeyError::Other(err) => err,
+        }
+    }
+}
+
 impl<T: Into<Error>> From<T> for FindKeyError {
     fn from(err: T) -> Self {
         FindKeyError::Other(err.into())

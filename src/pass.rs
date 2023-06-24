@@ -28,7 +28,7 @@ use chrono::prelude::*;
 use totp_rs::TOTP;
 
 use crate::{
-    crypto::{Crypto, CryptoImpl, GpgMe, Sequoia, VerificationError},
+    crypto::{Crypto, CryptoImpl, FindKeyError, GpgMe, Sequoia, VerificationError},
     git::{
         add_and_commit_internal, commit, find_last_commit, init_git_repo, match_with_parent,
         move_and_commit, push_password_if_match, read_git_meta_data, remove_and_commit,
@@ -635,41 +635,60 @@ impl PasswordStore {
     /// Removes a key from the .gpg-id file and re-encrypts all the passwords
     /// # Errors
     /// Returns an `Err` if the gpg_id file should be verified and it can't be or if the recipient is the last one.
-    pub fn remove_recipient(&self, r: &Recipient, path: &Path) -> Result<()> {
+    pub fn remove_recipient(
+        &self,
+        r: &Recipient,
+        path: &Path,
+        key_password: Option<String>,
+    ) -> Result<(), FindKeyError> {
         let gpg_id_file = &self.recipients_file_for_dir(path)?;
         let gpg_id_file_content = std::fs::read_to_string(gpg_id_file)?;
+
+        // `find_key` must be run before `reencrypt_all_password_entries`.
+        // Do it here to avoid writing to the .gpg-id file if the
+        // password is wrong or isn't supplied when it should be.
+        self.crypto.find_key(key_password)?;
 
         let res = self.remove_recipient_inner(r, path);
 
         if res.is_err() {
             std::fs::write(gpg_id_file, gpg_id_file_content)?;
         }
-        res
+        Ok(res?)
     }
 
     /// Adds a key to the .gpg-id file in the path directory and re-encrypts all the passwords
     /// # Errors
     /// Returns an `Err` if the gpg_id file should be verified and it can't be or there is some problem with
     /// the encryption.
-    pub fn add_recipient(&mut self, r: &Recipient, path: &Path, config_path: &Path) -> Result<()> {
+    pub fn add_recipient(
+        &mut self,
+        r: &Recipient,
+        path: &Path,
+        config_path: &Path,
+        key_password: Option<String>,
+    ) -> Result<(), FindKeyError> {
+        // `find_key` must be run before `reencrypt_all_password_entries`.
+        self.crypto.find_key(key_password)?;
+
         if !self.crypto.is_key_in_keyring(r)? {
             self.crypto.pull_keys(&[r], config_path)?;
         }
         if !self.crypto.is_key_in_keyring(r)? {
-            return Err(Error::Generic(
+            Err(Error::Generic(
                 "Key isn't in keyring and couldn't be downloaded from keyservers",
-            ));
+            ))?;
         }
 
         let dir = self.root.join(path);
         if !dir.exists() {
-            return Err(Error::Generic("path doesn't exist"));
+            Err(Error::Generic("path doesn't exist"))?;
         }
         let dir = std::fs::canonicalize(self.root.join(path))?;
         let root = std::fs::canonicalize(&self.root)?;
 
         if !dir.starts_with(root) {
-            return Err(Error::Generic("path traversal not allowed"));
+            Err(Error::Generic("path traversal not allowed"))?;
         }
         if !dir.join(".gpg-id").exists() {
             std::fs::File::create(dir.join(".gpg-id"))?;
@@ -681,7 +700,7 @@ impl PasswordStore {
             &self.valid_gpg_signing_keys,
             self.crypto.as_ref(),
         )?;
-        self.reencrypt_all_password_entries()
+        Ok(self.reencrypt_all_password_entries()?)
     }
 
     /// Reencrypt all the entries in the store, for example when a new collaborator is added
@@ -689,10 +708,17 @@ impl PasswordStore {
     /// # Errors
     /// Returns an `Err` if the gpg_id file should be verified and it can't be or there is some problem with
     /// the encryption.
+    /// # Panics
+    /// May panic if self.crypto.find_key() has not been run successfully in the past.
     fn reencrypt_all_password_entries(&self) -> Result<()> {
         let mut names: Vec<PathBuf> = Vec::new();
         for entry in self.all_passwords()? {
-            entry.update_internal(&entry.secret(self)?, self)?;
+            entry.update_internal(
+                &entry
+                    .secret(self, None)
+                    .map_err(FindKeyError::unwrap_other)?,
+                self,
+            )?;
             names.push(append_extension(PathBuf::from(&entry.name), ".gpg"));
         }
         names.push(PathBuf::from(".gpg-id"));
@@ -756,9 +782,14 @@ impl PasswordStore {
     ///returns the index in the password vec of the renamed `PasswordEntry`
     /// # Errors
     /// Returns an `Err` if the file is missing, or the target already exists.
-    pub fn rename_file(&mut self, old_name: &str, new_name: &str) -> Result<usize> {
+    pub fn rename_file(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        key_password: Option<String>,
+    ) -> Result<usize, FindKeyError> {
         if new_name.starts_with('/') || new_name.contains("..") {
-            return Err(Error::Generic("directory traversal not allowed"));
+            Err(Error::Generic("directory traversal not allowed"))?;
         }
 
         let mut old_path = self.root.clone();
@@ -769,12 +800,14 @@ impl PasswordStore {
         let new_path = append_extension(new_path, ".gpg");
 
         if !old_path.exists() {
-            return Err(Error::Generic("source file is missing"));
+            Err(Error::Generic("source file is missing"))?;
         }
 
         if new_path.exists() {
-            return Err(Error::Generic("can't target file already exists"));
+            Err(Error::Generic("can't target file already exists"))?;
         }
+
+        self.crypto.find_key(key_password)?;
 
         let mut new_path_dir = new_path.clone();
         new_path_dir.pop();
@@ -996,28 +1029,46 @@ impl PasswordEntry {
     /// Decrypts and returns the full content of the `PasswordEntry`
     /// # Errors
     /// Returns an `Err` if the path is empty
-    pub fn secret(&self, store: &PasswordStore) -> Result<String> {
+    pub fn secret(
+        &self,
+        store: &PasswordStore,
+        key_password: Option<String>,
+    ) -> Result<String, FindKeyError> {
         let s = fs::metadata(&self.path)?;
         if s.len() == 0 {
-            return Err(Error::Generic("empty password file"));
+            Err(Error::Generic("empty password file"))?;
         }
 
+        store.crypto.find_key(key_password)?;
+
         let content = fs::read(&self.path)?;
-        store.crypto.decrypt_string(&content)
+        Ok(store.crypto.decrypt_string(&content)?)
     }
 
     /// Decrypts and returns the first line of the `PasswordEntry`
     /// # Errors
     /// Returns an `Err` if the decryption fails
-    pub fn password(&self, store: &PasswordStore) -> Result<String> {
-        Ok(self.secret(store)?.split('\n').take(1).collect())
+    pub fn password(
+        &self,
+        store: &PasswordStore,
+        key_password: Option<String>,
+    ) -> Result<String, FindKeyError> {
+        Ok(self
+            .secret(store, key_password)?
+            .split('\n')
+            .take(1)
+            .collect())
     }
 
     /// decrypts and returns a TOTP code if the entry contains a otpauth:// url
     /// # Errors
     /// Returns an `Err` if the code generation fails
-    pub fn mfa(&self, store: &PasswordStore) -> Result<String> {
-        let secret = self.secret(store)?;
+    pub fn mfa(
+        &self,
+        store: &PasswordStore,
+        key_password: Option<String>,
+    ) -> Result<String, FindKeyError> {
+        let secret = self.secret(store, key_password)?;
 
         if let Some(start_pos) = secret.find("otpauth://") {
             let end_pos = {
@@ -1033,7 +1084,7 @@ impl PasswordEntry {
             let totp = TOTP::from_url(&secret[start_pos..end_pos])?;
             Ok(totp.generate_current()?)
         } else {
-            Err(Error::Generic("No otpauth:// url in secret"))
+            Err(Error::Generic("No otpauth:// url in secret"))?
         }
     }
 
