@@ -810,6 +810,10 @@ impl Crypto for Sequoia {
 
             Ok(std::str::from_utf8(&sink).unwrap().to_owned())
         } else {
+            // TODO: this gives you a very cryptic error if you have a cert
+            // without a key. I can't quite tell if GPG IPC works under some
+            // circumstances or if it's just been sitting here broken.
+
             // Make a helper that that feeds the recipient's secret key to the
             // decryptor.
             let helper = Helper {

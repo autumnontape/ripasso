@@ -174,6 +174,13 @@ where
         // I'll have to rework a lot of what I did in pass.rs,
         // but decrypting the key should probably be done in
         // a separate thread to avoid blocking the UI on the KDF.
+        // this may have the additional advantage of letting me
+        // use FnOnce in this function instead of Fn, since I
+        // would be calling crypto.find_key() directly (or
+        // almost directly) from here instead of making the
+        // callback do it. there's a few clones and one clever
+        // Cell<Option>::take that could be dispensed with by
+        // using FnOnce.
         match cb(ui, Some(key_password)) {
             Ok(()) => {}
             Err(FindKeyError::WrongPassword) => {
