@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt::{Display, Formatter, Write},
     fs,
@@ -18,7 +19,6 @@ use sequoia_openpgp::{
         },
         Parse,
     },
-    policy::Policy,
     serialize::{
         stream::{Armorer, Encryptor, LiteralWriter, Message, Signer},
         Serialize,
@@ -111,6 +111,22 @@ pub enum FindSigningFingerprintStrategy {
     GIT,
     /// Will ask gpg to find the users fingerprint
     GPG,
+}
+
+/// TODO
+pub enum FindKeyError {
+    /// Decrypting the key failed with the given password. Either no password was given
+    /// where one was needed, a password was given where none was needed, or a password
+    /// was given but failed to decrypt the key.
+    WrongPassword,
+    /// An error other than a wrong or missing password occurred.
+    Other(Error),
+}
+
+impl From<crate::error::Error> for FindKeyError {
+    fn from(err: crate::error::Error) -> Self {
+        FindKeyError::Other(err)
+    }
 }
 
 /// Models the interactions that can be done on a pgp key
@@ -216,6 +232,9 @@ pub trait Crypto {
 
     /// Returns the fingerprint of the user using ripasso
     fn own_fingerprint(&self) -> Option<[u8; 20]>;
+
+    /// TODO
+    fn find_key(&self, password: Option<String>) -> std::result::Result<(), FindKeyError>;
 }
 
 /// Used when the user configures gpgme to be used as a pgp backend.
@@ -415,6 +434,10 @@ impl Crypto for GpgMe {
     fn own_fingerprint(&self) -> Option<[u8; 20]> {
         None
     }
+
+    fn find_key(&self, _password: Option<String>) -> std::result::Result<(), FindKeyError> {
+        Ok(())
+    }
 }
 
 /// Tries to download keys from keys.openpgp.org
@@ -438,10 +461,8 @@ fn download_keys(recipient_key_id: &str) -> Result<String> {
 
 /// Internal helper struct for sequoia implementation.
 struct Helper<'a> {
-    /// A sequoia policy to use in various operations
-    policy: &'a dyn Policy,
-    /// the users cert
-    secret: Option<&'a sequoia_openpgp::Cert>,
+    /// The keypair for decrypting passwords
+    keypair: Option<sequoia_openpgp::crypto::KeyPair>,
     /// all certs
     key_ring: &'a HashMap<[u8; 20], Arc<sequoia_openpgp::Cert>>,
     /// This is all the certificates that are allowed to sign something
@@ -517,7 +538,9 @@ impl<'a> DecryptionHelper for Helper<'a> {
     where
         D: FnMut(SymmetricAlgorithm, &SessionKey) -> bool,
     {
-        if self.secret.is_none() {
+        let pair = if let Some(pair) = &mut self.keypair {
+            pair
+        } else {
             // we don't know which key is the users own key, so lets try them all
 
             let mut selected_fingerprint: Option<sequoia_openpgp::Fingerprint> = None;
@@ -541,34 +564,15 @@ impl<'a> DecryptionHelper for Helper<'a> {
             }
 
             return Ok(selected_fingerprint);
-        }
-        // The encryption key is the first and only subkey.
-        let key = self
-            .secret
-            .ok_or_else(|| anyhow::anyhow!("no user secret"))?
-            .keys()
-            .unencrypted_secret()
-            .with_policy(self.policy, None)
-            .for_transport_encryption()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no keys capable of encryption"))?
-            .key()
-            .clone();
-
-        // The secret key is not encrypted.
-        let mut pair = key.into_keypair()?;
+        };
 
         for pkesk in pkesks {
             if pkesk
-                .decrypt(&mut pair, sym_algo)
+                .decrypt(pair, sym_algo)
                 .map(|(algo, sk)| decrypt(algo, &sk))
                 .unwrap_or(false)
             {
-                return Ok(Some(
-                    self.secret
-                        .ok_or_else(|| anyhow::anyhow!("no user secret"))?
-                        .fingerprint(),
-                ));
+                return Ok(Some(pair.public().fingerprint()));
             }
         }
 
@@ -622,6 +626,8 @@ pub struct Sequoia {
     user_key_id: [u8; 20],
     /// All certs in the keys directory
     key_ring: HashMap<[u8; 20], Arc<sequoia_openpgp::Cert>>,
+    /// The keypair used for this store if it's been found and, if applicable, decrypted
+    keypair: RefCell<Option<sequoia_openpgp::crypto::KeyPair>>,
     /// The home directory of the user, for gnupg context
     user_home: std::path::PathBuf,
 }
@@ -651,6 +657,7 @@ impl Sequoia {
         Ok(Self {
             user_key_id: own_fingerprint,
             key_ring,
+            keypair: RefCell::new(None),
             user_home: user_home.to_path_buf(),
         })
     }
@@ -658,11 +665,13 @@ impl Sequoia {
     pub fn from_values(
         user_key_id: [u8; 20],
         key_ring: HashMap<[u8; 20], Arc<sequoia_openpgp::Cert>>,
+        // TODO: this function is used for testing. add decryption_key to params.
         user_home: &Path,
     ) -> Self {
         Self {
             user_key_id,
             key_ring,
+            keypair: RefCell::new(None),
             user_home: user_home.to_path_buf(),
         }
     }
@@ -724,6 +733,43 @@ impl Sequoia {
 
         Ok("Downloaded ok".to_owned())
     }
+
+    /// TODO
+    fn own_decrypt_cert(&self) -> Result<Arc<sequoia_openpgp::Cert>> {
+        let decrypt_cert = self
+            .key_ring
+            .get(&self.user_key_id)
+            .ok_or(Error::Generic("no key for user found"))?;
+
+        Ok(decrypt_cert.clone())
+    }
+
+    /// TODO
+    fn own_decrypt_key(
+        &self,
+    ) -> Result<
+        sequoia_openpgp::packet::Key<
+            sequoia_openpgp::packet::key::SecretParts,
+            sequoia_openpgp::packet::key::UnspecifiedRole,
+        >,
+    > {
+        // TODO: just roll this into find_key
+
+        let p = sequoia_openpgp::policy::StandardPolicy::new();
+
+        let decrypt_key = self
+            .own_decrypt_cert()?
+            .keys()
+            .secret()
+            .with_policy(&p, None)
+            .for_transport_encryption()
+            .next()
+            .ok_or(Error::Generic("no keys capable of encryption"))?
+            .key()
+            .clone();
+
+        Ok(decrypt_key)
+    }
 }
 
 impl Crypto for Sequoia {
@@ -732,17 +778,11 @@ impl Crypto for Sequoia {
 
         let mut sink: Vec<u8> = vec![];
 
-        let decrypt_key = self
-            .key_ring
-            .get(&self.user_key_id)
-            .ok_or(Error::Generic("no key for user found"))?;
-
-        if decrypt_key.is_tsk() {
+        if let Some(keypair) = self.keypair.borrow().clone() {
             // Make a helper that that feeds the recipient's secret key to the
             // decryptor.
             let helper = Helper {
-                policy: &p,
-                secret: Some(decrypt_key),
+                keypair: Some(keypair),
                 key_ring: &self.key_ring,
                 public_keys: vec![],
                 ctx: None,
@@ -762,8 +802,7 @@ impl Crypto for Sequoia {
             // Make a helper that that feeds the recipient's secret key to the
             // decryptor.
             let helper = Helper {
-                policy: &p,
-                secret: Some(decrypt_key),
+                keypair: None,
                 key_ring: &self.key_ring,
                 public_keys: vec![],
                 ctx: Some(sequoia_ipc::gnupg::Context::with_homedir(&self.user_home)?),
@@ -893,8 +932,7 @@ impl Crypto for Sequoia {
         // Make a helper that that feeds the sender's public key to the
         // verifier.
         let helper = Helper {
-            policy: &p,
-            secret: None,
+            keypair: None,
             key_ring: &self.key_ring,
             public_keys: senders,
             ctx: None,
@@ -974,6 +1012,38 @@ impl Crypto for Sequoia {
 
     fn own_fingerprint(&self) -> Option<[u8; 20]> {
         Some(self.user_key_id)
+    }
+
+    fn find_key(&self, password: Option<String>) -> std::result::Result<(), FindKeyError> {
+        // move the password into a `Password` as soon as possible
+        let password = password.map(sequoia_openpgp::crypto::Password::from);
+        // save whether a password was given so we can drop `password` as soon as possible
+        let password_is_none = password.is_none();
+
+        if self.keypair.borrow().is_some() || !self.own_decrypt_cert()?.is_tsk() {
+            return Ok(());
+        }
+
+        let mut decrypt_key = self.own_decrypt_key()?;
+
+        if let Some(password) = password {
+            decrypt_key = decrypt_key
+                .decrypt_secret(&password)
+                .map_err(|_| FindKeyError::WrongPassword)?;
+        }
+
+        match decrypt_key.into_keypair() {
+            Ok(keypair) => {
+                *self.keypair.borrow_mut() = Some(keypair);
+
+                Ok(())
+            }
+            Err(_) => {
+                assert!(password_is_none);
+
+                Err(FindKeyError::WrongPassword)
+            }
+        }
     }
 }
 
