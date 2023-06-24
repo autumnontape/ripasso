@@ -15,6 +15,7 @@
 */
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     path::{Path, PathBuf},
     process,
@@ -37,7 +38,7 @@ use cursive::{
 use hex::FromHex;
 use pass::Result;
 use ripasso::{
-    crypto::CryptoImpl,
+    crypto::{CryptoImpl, FindKeyError},
     git::{pull, push},
     pass,
     pass::{
@@ -131,29 +132,100 @@ fn page_up(ui: &mut Cursive) {
     );
 }
 
+fn try_passwords<F>(ui: &mut Cursive, cb: F)
+where
+    F: Fn(&mut Cursive, Option<String>) -> Result<(), FindKeyError> + 'static,
+{
+    // TODO: can we avoid releasing zalgo here?
+
+    match cb(ui, None) {
+        Ok(()) => return,
+        Err(FindKeyError::WrongPassword) => {}
+        Err(FindKeyError::Other(err)) => {
+            helpers::errorbox(ui, &err);
+            return;
+        }
+    }
+
+    let mut key_password_fields = LinearLayout::horizontal();
+    key_password_fields.add_child(
+        TextView::new(CATALOG.gettext("Password: "))
+            .with_name("key_password_name")
+            .fixed_size((10_usize, 1_usize)),
+    );
+    key_password_fields.add_child(
+        EditView::new()
+            .secret()
+            .with_name("key_password_input")
+            .fixed_size((50_usize, 1_usize)),
+    );
+
+    let unlock_fn = Rc::new(move |ui: &mut Cursive| {
+        let key_password = match get_value_from_input(ui, "key_password_input") {
+            Some(key_password) if !key_password.is_empty() => key_password,
+            _ => return,
+        };
+
+        ui.pop_layer();
+
+        let key_password = Rc::try_unwrap(key_password).unwrap_or_else(|rc| (*rc).clone());
+
+        // TODO:
+        // I'll have to rework a lot of what I did in pass.rs,
+        // but decrypting the key should probably be done in
+        // a separate thread to avoid blocking the UI on the KDF.
+        match cb(ui, Some(key_password)) {
+            Ok(()) => {}
+            Err(FindKeyError::WrongPassword) => {
+                // TODO: make it possible to localize this error
+                helpers::errorbox(ui, &pass::Error::Generic("Password didn't work."));
+            }
+            Err(FindKeyError::Other(err)) => {
+                helpers::errorbox(ui, &err);
+            }
+        }
+    });
+
+    let d = Dialog::around(key_password_fields)
+        .title(CATALOG.gettext("Unlock decryption key"))
+        .button(CATALOG.gettext("Unlock"), {
+            let unlock_fn = unlock_fn.clone();
+            move |ui| unlock_fn(ui)
+        })
+        .dismiss_button(CATALOG.gettext("Cancel"));
+
+    let ev = OnEventView::new(d)
+        .on_event(Key::Esc, |s| {
+            s.pop_layer();
+        })
+        .on_event(Key::Enter, move |ui| unlock_fn(ui));
+
+    ui.add_layer(ev);
+}
+
 fn copy(ui: &mut Cursive, store: PasswordStoreType) {
     let sel = ui
         .find_name::<SelectView<pass::PasswordEntry>>("results")
         .unwrap()
         .selection();
 
-    if sel.is_none() {
-        return;
-    }
-    if let Err(err) = || -> pass::Result<()> {
-        helpers::set_clipboard(sel.unwrap().secret(&*store.lock()?.lock()?)?)?;
-        Ok(())
-    }() {
-        helpers::errorbox(ui, &err);
-        return;
-    }
+    let sel = match sel {
+        Some(sel) => sel,
+        None => return,
+    };
 
-    thread::spawn(|| {
-        thread::sleep(time::Duration::from_secs(40));
-        helpers::set_clipboard(String::new()).unwrap();
-    });
-    ui.call_on_name("status_bar", |l: &mut TextView| {
-        l.set_content(CATALOG.gettext("Copied password to copy buffer for 40 seconds"));
+    try_passwords(ui, move |ui, key_password| {
+        helpers::set_clipboard(sel.secret(&*store.lock()?.lock()?, key_password)?)?;
+
+        thread::spawn(|| {
+            thread::sleep(time::Duration::from_secs(40));
+            helpers::set_clipboard(String::new()).unwrap();
+        });
+        ui.call_on_name("status_bar", |l: &mut TextView| {
+            l.set_content(CATALOG.gettext("Copied password to copy buffer for 40 seconds"));
+        });
+
+        Ok(())
     });
 }
 
@@ -163,23 +235,23 @@ fn copy_first_line(ui: &mut Cursive, store: PasswordStoreType) {
         .unwrap()
         .selection();
 
-    if sel.is_none() {
-        return;
-    }
-    if let Err(err) = || -> pass::Result<()> {
-        helpers::set_clipboard(sel.unwrap().secret(&*store.lock()?.lock()?)?)?;
-        Ok(())
-    }() {
-        helpers::errorbox(ui, &err);
-        return;
-    }
+    let sel = match sel {
+        Some(sel) => sel,
+        None => return,
+    };
 
-    thread::spawn(|| {
-        thread::sleep(time::Duration::from_secs(40));
-        helpers::set_clipboard(String::new()).unwrap();
-    });
-    ui.call_on_name("status_bar", |l: &mut TextView| {
-        l.set_content(CATALOG.gettext("Copied password to copy buffer for 40 seconds"));
+    try_passwords(ui, move |ui, key_password| {
+        helpers::set_clipboard(sel.secret(&*store.lock()?.lock()?, key_password)?)?;
+
+        thread::spawn(|| {
+            thread::sleep(time::Duration::from_secs(40));
+            helpers::set_clipboard(String::new()).unwrap();
+        });
+        ui.call_on_name("status_bar", |l: &mut TextView| {
+            l.set_content(CATALOG.gettext("Copied password to copy buffer for 40 seconds"));
+        });
+
+        Ok(())
     });
 }
 
@@ -189,19 +261,19 @@ fn copy_mfa(ui: &mut Cursive, store: PasswordStoreType) {
         .unwrap()
         .selection();
 
-    if sel.is_none() {
-        return;
-    }
-    if let Err(err) = || -> pass::Result<()> {
-        helpers::set_clipboard(sel.unwrap().mfa(&*store.lock()?.lock()?)?)?;
-        Ok(())
-    }() {
-        helpers::errorbox(ui, &err);
-        return;
-    }
+    let sel = match sel {
+        Some(sel) => sel,
+        None => return,
+    };
 
-    ui.call_on_name("status_bar", |l: &mut TextView| {
-        l.set_content(CATALOG.gettext("Copied MFA code to copy buffer"));
+    try_passwords(ui, move |ui, key_password| {
+        helpers::set_clipboard(sel.mfa(&*store.lock()?.lock()?, key_password)?)?;
+
+        ui.call_on_name("status_bar", |l: &mut TextView| {
+            l.set_content(CATALOG.gettext("Copied MFA code to copy buffer"));
+        });
+
+        Ok(())
     });
 }
 
@@ -395,52 +467,49 @@ fn open(ui: &mut Cursive, store: PasswordStoreType) -> Result<()> {
 
     let password_entry = password_entry_opt.unwrap();
 
-    let password = {
-        match password_entry.secret(&*store.lock()?.lock()?) {
-            Ok(p) => p,
-            Err(err) => {
-                helpers::errorbox(ui, &err);
-                return Ok(());
-            }
-        }
-    };
-    let d = Dialog::around(TextArea::new().content(password).with_name("editbox"))
-        .button(CATALOG.gettext("Save"), move |s| {
-            let new_password = s
-                .call_on_name("editbox", |e: &mut TextArea| e.get_content().to_string())
-                .unwrap();
+    try_passwords(ui, move |ui, key_password| {
+        let password = password_entry.secret(&*store.lock()?.lock()?, key_password)?;
+        let store = store.clone();
+        let d = Dialog::around(TextArea::new().content(password).with_name("editbox"))
+            .button(CATALOG.gettext("Save"), move |s| {
+                let new_password = s
+                    .call_on_name("editbox", |e: &mut TextArea| e.get_content().to_string())
+                    .unwrap();
 
-            if new_password.contains("otpauth://") {
-                let store = store.clone();
-                let d = Dialog::around(TextView::new(CATALOG.gettext("It seems like you are trying to save a TOTP code to the password store. This will reduce your 2FA solution to just 1FA, do you want to proceed?")))
-                    .button(CATALOG.gettext("Save"), move |s| {
-                        do_password_save(s, &new_password, store.clone(), true);
-                    })
-                    .dismiss_button(CATALOG.gettext("Close"));
+                if new_password.contains("otpauth://") {
+                    let store = store.clone();
+                    let d = Dialog::around(TextView::new(CATALOG.gettext("It seems like you are trying to save a TOTP code to the password store. This will reduce your 2FA solution to just 1FA, do you want to proceed?")))
+                        .button(CATALOG.gettext("Save"), move |s| {
+                            do_password_save(s, &new_password, store.clone(), true);
+                        })
+                        .dismiss_button(CATALOG.gettext("Close"));
 
-                let ev = OnEventView::new(d).on_event(Key::Esc, |s| {
-                    s.pop_layer();
+                    let ev = OnEventView::new(d).on_event(Key::Esc, |s| {
+                        s.pop_layer();
+                    });
+
+                    s.add_layer(ev);
+                } else {
+                    do_password_save(s, &new_password, store.clone(), false);
+                };
+
+            })
+            .button(CATALOG.gettext("Generate"), move |s| {
+                let new_password = ripasso::words::generate_password(6);
+                s.call_on_name("editbox", |e: &mut TextArea| {
+                    e.set_content(new_password);
                 });
+            })
+            .dismiss_button(CATALOG.gettext("Close"));
 
-                s.add_layer(ev);
-            } else {
-                do_password_save(s, &new_password, store.clone(), false);
-            };
+        let ev = OnEventView::new(d).on_event(Key::Esc, |s| {
+            s.pop_layer();
+        });
 
-        })
-        .button(CATALOG.gettext("Generate"), move |s| {
-            let new_password = ripasso::words::generate_password(6);
-            s.call_on_name("editbox", |e: &mut TextArea| {
-                e.set_content(new_password);
-            });
-        })
-        .dismiss_button(CATALOG.gettext("Close"));
+        ui.add_layer(ev);
 
-    let ev = OnEventView::new(d).on_event(Key::Esc, |s| {
-        s.pop_layer();
+        Ok(())
     });
-
-    ui.add_layer(ev);
 
     Ok(())
 }
@@ -456,32 +525,31 @@ fn do_rename_file(ui: &mut Cursive, store: PasswordStoreType) -> Result<()> {
         .unwrap()
         .get_content();
 
-    let res = store
-        .lock()?
-        .lock()?
-        .rename_file(old_name.source(), &new_name);
-    match res {
-        Err(err) => {
-            helpers::errorbox(ui, &err);
+    try_passwords(ui, move |ui, key_password| {
+        let index =
+            store
+                .lock()?
+                .lock()?
+                .rename_file(old_name.source(), &new_name, key_password)?;
+
+        let mut l = ui
+            .find_name::<SelectView<pass::PasswordEntry>>("results")
+            .unwrap();
+
+        if let Some(delete_id) = l.selected_id() {
+            l.remove_item(delete_id);
         }
-        Ok(index) => {
-            let mut l = ui
-                .find_name::<SelectView<pass::PasswordEntry>>("results")
-                .unwrap();
 
-            if let Some(delete_id) = l.selected_id() {
-                l.remove_item(delete_id);
-            }
+        let col = screen_width(ui);
+        let store = store.lock()?;
+        let entry = &store.lock()?.passwords[index];
+        l.add_item(create_label(entry, col), entry.clone());
+        l.sort_by_label();
 
-            let col = screen_width(ui);
-            let store = store.lock()?;
-            let entry = &store.lock()?.passwords[index];
-            l.add_item(create_label(entry, col), entry.clone());
-            l.sort_by_label();
+        ui.pop_layer();
 
-            ui.pop_layer();
-        }
-    }
+        Ok(())
+    });
 
     Ok(())
 }
@@ -702,7 +770,7 @@ fn create(ui: &mut Cursive, store: PasswordStoreType) {
 }
 
 fn delete_recipient(ui: &mut Cursive, store: PasswordStoreType) -> Result<()> {
-    let mut l = ui
+    let l = ui
         .find_name::<SelectView<Option<(PathBuf, pass::Recipient)>>>("recipients")
         .unwrap();
     let sel = l.selection();
@@ -712,21 +780,30 @@ fn delete_recipient(ui: &mut Cursive, store: PasswordStoreType) -> Result<()> {
     }
 
     let binding = sel.unwrap();
-    let (path, recipient): &(PathBuf, Recipient) = binding.as_ref().as_ref().unwrap();
 
-    let store = store.lock()?;
-    let store = store.lock()?;
-    let remove_recipient_res = store.remove_recipient(recipient, path);
-    if remove_recipient_res.is_ok() {
+    let l = Cell::new(Some(l));
+
+    try_passwords(ui, move |ui, key_password| {
+        let (path, recipient): &(PathBuf, Recipient) = binding.as_ref().as_ref().unwrap();
+
+        let store = store.lock()?;
+        let store = store.lock()?;
+        store.remove_recipient(recipient, path, key_password)?;
+
+        let mut l = l.take().unwrap();
+
         let delete_id = l.selected_id().unwrap();
         l.remove_item(delete_id);
         ui.call_on_name("status_bar", |l: &mut TextView| {
             l.set_content(CATALOG.gettext("Deleted team member from password store"));
         });
+
+        ui.pop_layer();
+
         Ok(())
-    } else {
-        Err(remove_recipient_res.err().unwrap())
-    }
+    });
+
+    Ok(())
 }
 
 fn delete_recipient_verification(ui: &mut Cursive, store: PasswordStoreType) {
@@ -746,13 +823,11 @@ fn delete_recipient_verification(ui: &mut Cursive, store: PasswordStoreType) {
     ));
 }
 
-fn add_recipient(ui: &mut Cursive, store: PasswordStoreType, config_path: &Path) -> Result<()> {
+fn add_recipient(ui: &mut Cursive, store: PasswordStoreType, config_path: PathBuf) -> Result<()> {
     let l = &*get_value_from_input(ui, "key_id_input").unwrap();
     let dir = &*get_value_from_input(ui, "dir_id_input").unwrap();
 
-    let store = store.lock()?;
-    let mut store = store.lock()?;
-    let recipient_from_res = store.recipient_from(l, &[], None);
+    let recipient_from_res = store.lock()?.lock()?.recipient_from(l, &[], None);
     match recipient_from_res {
         Err(err) => helpers::errorbox(ui, &err),
         Ok(recipient) => {
@@ -762,45 +837,41 @@ fn add_recipient(ui: &mut Cursive, store: PasswordStoreType, config_path: &Path)
             }
 
             let dir_path = std::path::PathBuf::from(dir);
-            let res = store.add_recipient(&recipient, &dir_path, config_path);
-            match res {
-                Err(err) => helpers::errorbox(ui, &err),
-                Ok(_) => {
-                    let all_recipients_res = store.recipients_for_path(&dir_path);
-                    match all_recipients_res {
-                        Err(err) => helpers::errorbox(ui, &err),
-                        Ok(recipients) => {
-                            let mut max_width_key = 0;
-                            let mut max_width_name = 0;
-                            for recipient in &recipients {
-                                if recipient.key_id.len() > max_width_key {
-                                    max_width_key = recipient.key_id.len();
-                                }
-                                if recipient.name.len() > max_width_name {
-                                    max_width_name = recipient.name.len();
-                                }
-                            }
 
-                            let mut recipients_view = ui
-                                .find_name::<SelectView<Option<(PathBuf, pass::Recipient)>>>(
-                                    "recipients",
-                                )
-                                .unwrap();
-                            recipients_view.add_item(
-                                render_recipient_label(&recipient, max_width_key, max_width_name),
-                                Some((dir_path, recipient)),
-                            );
+            try_passwords(ui, move |ui, key_password| {
+                let store = store.lock()?;
+                let mut store = store.lock()?;
 
-                            ui.pop_layer();
-                            ui.call_on_name("status_bar", |l: &mut TextView| {
-                                l.set_content(
-                                    CATALOG.gettext("Added team member to password store"),
-                                );
-                            });
-                        }
+                store.add_recipient(&recipient, &dir_path, &config_path, key_password)?;
+                let recipients = store.recipients_for_path(&dir_path)?;
+
+                let mut max_width_key = 0;
+                let mut max_width_name = 0;
+
+                for recipient in &recipients {
+                    if recipient.key_id.len() > max_width_key {
+                        max_width_key = recipient.key_id.len();
+                    }
+                    if recipient.name.len() > max_width_name {
+                        max_width_name = recipient.name.len();
                     }
                 }
-            }
+
+                let mut recipients_view = ui
+                    .find_name::<SelectView<Option<(PathBuf, pass::Recipient)>>>("recipients")
+                    .unwrap();
+                recipients_view.add_item(
+                    render_recipient_label(&recipient, max_width_key, max_width_name),
+                    Some((dir_path.clone(), recipient.clone())),
+                );
+
+                ui.pop_layer();
+                ui.call_on_name("status_bar", |l: &mut TextView| {
+                    l.set_content(CATALOG.gettext("Added team member to password store"));
+                });
+
+                Ok(())
+            });
         }
     }
 
@@ -841,7 +912,7 @@ fn add_recipient_dialog(ui: &mut Cursive, store: PasswordStoreType, config_path:
     let cf = CircularFocus::new(
         Dialog::around(all_fields)
             .button(CATALOG.gettext("Yes"), move |ui: &mut Cursive| {
-                let res = add_recipient(ui, store.clone(), &config_path);
+                let res = add_recipient(ui, store.clone(), config_path.clone());
                 if let Err(err) = res {
                     helpers::errorbox(ui, &err)
                 }
