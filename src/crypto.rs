@@ -119,6 +119,9 @@ pub enum FindKeyError {
     /// where one was needed, a password was given where none was needed, or a password
     /// was given but failed to decrypt the key.
     WrongPassword,
+    /// The key is being decrypted on another thread. The callback you passed to
+    /// `find_key` will be called on that thread when it's done.
+    WaitForCallback,
     /// An error other than a wrong or missing password occurred.
     Other(Error),
 }
@@ -245,7 +248,11 @@ pub trait Crypto {
     fn own_fingerprint(&self) -> Option<[u8; 20]>;
 
     /// TODO
-    fn find_key(&self, password: Option<String>) -> Result<(), FindKeyError>;
+    fn find_key(
+        &self,
+        password: Option<String>,
+        callback_when_threaded: Box<dyn FnOnce(Result<(), FindKeyError>) + Send>,
+    ) -> Result<(), FindKeyError>;
 }
 
 /// Used when the user configures gpgme to be used as a pgp backend.
@@ -446,7 +453,11 @@ impl Crypto for GpgMe {
         None
     }
 
-    fn find_key(&self, _password: Option<String>) -> Result<(), FindKeyError> {
+    fn find_key(
+        &self,
+        _password: Option<String>,
+        _callback_when_threaded: Box<dyn FnOnce(Result<(), FindKeyError>) + Send>,
+    ) -> Result<(), FindKeyError> {
         Ok(())
     }
 }
@@ -638,7 +649,7 @@ pub struct Sequoia {
     /// All certs in the keys directory
     key_ring: HashMap<[u8; 20], Arc<sequoia_openpgp::Cert>>,
     /// The keypair used for this store if it's been found and, if applicable, decrypted
-    keypair: RefCell<Option<sequoia_openpgp::crypto::KeyPair>>,
+    keypair: Arc<Mutex<Option<sequoia_openpgp::crypto::KeyPair>>>,
     /// The home directory of the user, for gnupg context
     user_home: std::path::PathBuf,
 }
@@ -1029,35 +1040,49 @@ impl Crypto for Sequoia {
         Some(self.user_key_id)
     }
 
-    fn find_key(&self, password: Option<String>) -> Result<(), FindKeyError> {
+    fn find_key(
+        &self,
+        password: Option<String>,
+        callback_when_threaded: Box<dyn FnOnce(Result<(), FindKeyError>) + Send>,
+    ) -> Result<(), FindKeyError> {
         // move the password into a `Password` as soon as possible
         let password = password.map(sequoia_openpgp::crypto::Password::from);
-        // save whether a password was given so we can drop `password` as soon as possible
-        let password_is_none = password.is_none();
 
-        if self.keypair.borrow().is_some() || !self.own_decrypt_cert()?.is_tsk() {
+        if self.keypair.lock().is_some() || !self.own_decrypt_cert()?.is_tsk() {
             return Ok(());
         }
 
-        let mut decrypt_key = self.own_decrypt_key()?;
+        let decrypt_key = self.own_decrypt_key()?;
 
-        if let Some(password) = password {
-            decrypt_key = decrypt_key
-                .decrypt_secret(&password)
-                .map_err(|_| FindKeyError::WrongPassword)?;
-        }
+        match password {
+            Some(password) => {
+                let keypair = self.keypair.clone();
 
-        match decrypt_key.into_keypair() {
-            Ok(keypair) => {
-                *self.keypair.borrow_mut() = Some(keypair);
+                std::thread::spawn(move || match decrypt_key.decrypt_secret(&password) {
+                    Ok(decrypt_key) => {
+                        let keypair = decrypt_key
+                            .into_keypair()
+                            .expect("into_keypair should succeed on a successfully decrypted key");
 
-                Ok(())
+                        *self.keypair.lock() = Some(keypair);
+
+                        callback_when_threaded(Ok(()));
+                    }
+                    Err(_) => {
+                        callback_when_threaded(Err(FindKeyError::WrongPassword));
+                    }
+                });
+
+                Err(FindKeyError::WaitForCallback)
             }
-            Err(_) => {
-                assert!(password_is_none);
+            None => match decrypt_key.into_keypair() {
+                Ok(keypair) => {
+                    *self.keypair.lock() = Some(keypair);
 
-                Err(FindKeyError::WrongPassword)
-            }
+                    Ok(())
+                }
+                Err(_) => Err(FindKeyError::WrongPassword),
+            },
         }
     }
 }
